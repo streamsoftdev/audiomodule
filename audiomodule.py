@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 import numpy as np
-import sys
 from multiprocessing import Queue
 from typing import NamedTuple
 from typing import TYPE_CHECKING
@@ -35,6 +34,33 @@ CD_RATE = 44100
 AV_RATE = 48000
 DVD_RATE = 96000
 
+PROBE_DATA = "probe_data"
+""" The buffer has received data. """
+
+MODULE_ERROR = "module_error"
+""" The module is reporting an error condition has arisen. """
+
+MODULE_LOG = "module_log"
+""" The module wants to log something. """
+
+AM_ERROR = -1
+"""Indicates the module is in an erroneous state."""
+
+AM_CONTINUE = 0
+"""Indicates the module can continue to produce data."""
+
+AM_COMPLETED = 1
+"""Indicates the module has no more data to produce."""
+
+AM_INPUT_REQUIRED = 2
+"""Indicates the module requires input data to produce data."""
+
+AM_CYCLIC_UNDERRUN = 3
+"""Indicates the module requires input from a module earlier in the sequence.
+
+Note that earlier means with a sequence number not greater than itself.
+"""
+
 def sw_dtype(self,sample_width:int=2):
     if sample_width == 1:
         return np.int8
@@ -42,6 +68,12 @@ def sw_dtype(self,sample_width:int=2):
         return np.int16
     if sample_width == 4:
         return np.float32
+
+def nice_frequency_str2(freq: float = 1.0):
+    if freq > 1000:
+        return f"{freq/1000.0:.0f}kHz"
+    else:
+        return f"{freq:.1f}Hz"
 
 class ModId(NamedTuple):
     name:str
@@ -69,8 +101,11 @@ class Buffer:
         self.dtype = dtype
         self.probe: BufferId = None
         self.observer: Queue = None
-        self.time = 0.0
-        self.delayed_time = 0.0
+        self._incoming_chunks = []
+        self._probe_chunks = []
+        self._time:int = 0 # number of samples
+        self._delayed_time:int = 0 # number of samples
+        self._size = 0
         self.reset()
 
     def reset(self):
@@ -78,45 +113,61 @@ class Buffer:
 
         An existing probe is not canceled by this method."""
 
-        self.buffer = self.get_empty_buffer()
-        self.time = 0.0
-        self.delayed_time = 0.0
+        self._buffer = self.get_empty_buffer()
+        self._time = 0
+        self._delayed_time = 0
+    
+    def _compact(self):
+        if len(self._incoming_chunks)>0:
+            self._buffer = np.concatenate([self._buffer]+self._incoming_chunks)
+            self._incoming_chunks=[]
+
+    def buffer(self):
+        """ Provides direct access to the internal buffer. """
+
+        self._compact()
+        return self._buffer
 
     def append(self, buf: np.ndarray):
         """Append `buf` to the buffer.
 
         The `buf` is sent to the observer if a probe has been set.
         """
+
         if buf.shape[1] < self.channels:
             nbuf = self.get_zero_buffer(buf.shape[0])
             nbuf[:,0:buf.shape[1]]=buf
         else:
             nbuf = buf[:,0:self.channels]
-        self.buffer = np.concatenate([self.buffer, nbuf])
+        self._incoming_chunks.append(nbuf)
+        self._size += len(nbuf)
         if self.probe:
-            self.probe_buffer = np.concatenate([self.probe_buffer,nbuf])
-            if len(self.probe_buffer>1024*4):
-                self.observer.put(('probe_data', (self.probe, self.probe_buffer), None))
-                self.probe_buffer=self.get_zero_buffer()
+            self._probe_chunks.append(nbuf)
+            if len(self._probe_chunks)>4:
+                self.observer.put((PROBE_DATA, (self.probe, 
+                    np.concatenate(self._probe_chunks)), None))
+                self._probe_chunks=[]
 
-    def get_chunk(self, chunk_size: int) -> BufferData:
+    def get_chunk(self, chunk_size: int = 1024) -> BufferData:
         """Returns up to `chunk_size` of data.
 
         If the buffer has not yet started advancing in time, returns an
         empty chunk of data of size `chunk_size`.
         """
 
-        actual_chunk_size = min([chunk_size, len(self.buffer)])
-        x = np.split(self.buffer, [actual_chunk_size])
-        self.buffer = x[1]
-        self.time += len(x[0])/self.sample_rate
-        if self.time == 0.0:  # no data has arrived yet
-            chunk = np.concatenate(
-                [x[0], self.get_empty_buffer(chunk_size-actual_chunk_size)])
-            self.delayed_time+= len(chunk)/self.sample_rate
+        self._compact()
+        actual_chunk_size = min([chunk_size, len(self._buffer)])
+        x = np.split(self._buffer, [actual_chunk_size])
+        self._buffer = x[1]
+        self._time += len(x[0])
+        self._size -= len(x[0])
+        if self._time == 0:  # no data has arrived yet
+            chunk = np.concatenate([x[0], 
+                self.get_empty_buffer(chunk_size-actual_chunk_size)])
+            self._delayed_time+= len(chunk)
         else:
             chunk = x[0]
-        return BufferData(chunk, len(self.buffer))
+        return BufferData(chunk, len(self._buffer))
 
     def get_all(self) -> np.ndarray:
         """Returns all the data from the buffer.
@@ -124,9 +175,11 @@ class Buffer:
         Call only if data is known to be in the buffer.
         """
 
-        x = self.buffer
-        self.time += len(x)/self.sample_rate
-        self.buffer = self.get_empty_buffer()
+        self._compact()
+        x = self._buffer
+        self._time += len(x)
+        self._buffer = self.get_empty_buffer()
+        self._size = 0
         return x
 
     def set_probe(self, observer: Queue, buffer_id: BufferId = None):
@@ -140,38 +193,38 @@ class Buffer:
         self.probe = buffer_id
         self.observer = observer
         if self.probe:
-            self.probe_buffer=self.get_zero_buffer()
+            self._probe_chunks=[]
 
     def size(self):
-        """Returns the size (number of samples) in the buffer."""
-        return len(self.buffer)
+        """Returns the size (number of samples) in the buffer.
+        
+        This is the sum of the `_buffer` len and the length of uncompacted
+        incoming chunks."""
+
+        return self._size
+        #return len(self._buffer)+sum([len(x) for x in self._incoming_chunks])
 
     def get_empty_buffer(self, size: int = 0):
         """Returns an empty array of length `size` with the same shape as the buffer."""
+
         return np.zeros(shape=(size, self.channels), dtype=self.dtype)
         
     def get_zero_buffer(self, size: int = 0):
         """Returns a zero array of length `size` with the same shape as the buffer."""
+
         return np.zeros(shape=(size, self.channels), dtype=self.dtype)
         
+    def get_time(self):
+        """ Return the time duration of input signal consumed. """
 
-AM_ERROR = -1
-"""Indicates the module is in an erroneous state."""
+        return self._time/self.sample_rate
 
-AM_CONTINUE = 0
-"""Indicates the module can continue to produce data."""
+    def get_delayed_time(self):
+        """ Return the total delay incurred at the input. """
 
-AM_COMPLETED = 1
-"""Indicates the module has no more data to produce."""
+        return self._delayed_time/self.sample_rate
 
-AM_INPUT_REQUIRED = 2
-"""Indicates the module requires input data to produce data."""
 
-AM_CYCLIC_UNDERRUN = 3
-"""Indicates the module requires input from a module earlier in the sequence.
-
-Note that earlier means with a sequence number not greater than itself.
-"""
 
 
 class AudioModule:
@@ -345,7 +398,7 @@ class AudioModule:
 
         for idx in range(self.get_num_inputs()):
             buf = self.get_in_buf(idx)
-            if buf.size() < self.chunk_size and buf.time > 0.0:
+            if buf.size() < self.chunk_size and buf.get_time() > 0:
                 x = self.get_in_modules(idx)
                 if x:
                     mod,out_idx = x
