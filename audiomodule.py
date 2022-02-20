@@ -69,11 +69,31 @@ def sw_dtype(self,sample_width:int=2):
     if sample_width == 4:
         return np.float32
 
+def hms_str(time: float = 1.0):
+    hours = int(time/3600)
+    mins = int((time-hours*3600)/60)
+    secs = (time-hours*3600-mins*60)
+    return f"{hours:02d}:{mins:02d}:{secs:08.5f}s"
+
+def nice_frequency_str(freq: float = 1.0):
+    if freq > 1000:
+        return f"{freq/1000.0}kHz"
+    else:
+        return f"{freq}Hz"
+
 def nice_frequency_str2(freq: float = 1.0):
     if freq > 1000:
         return f"{freq/1000.0:.0f}kHz"
     else:
         return f"{freq:.1f}Hz"
+
+def nice_channels(channels:int=1):
+    if channels==1:
+        return "mono"
+    elif channels==2:
+        return "stereo"
+    else:
+        return f"{channels} channels"
 
 class ModId(NamedTuple):
     name:str
