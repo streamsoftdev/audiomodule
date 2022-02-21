@@ -75,6 +75,17 @@ def hms_str(time: float = 1.0):
     secs = (time-hours*3600-mins*60)
     return f"{hours:02d}:{mins:02d}:{secs:08.5f}s"
 
+def hms2_str(time:float=1.0):
+    hours = int(time/3600)
+    mins = int((time-hours*3600)/60)
+    secs = (time-hours*3600-mins*60)
+    if hours>0:
+        return f"{hours}h{mins}m{secs:.3}s"
+    elif mins>0:
+        return f"{mins}m{secs:.3}s"
+    else:
+        return f"{secs:.3}s"
+
 def nice_frequency_str(freq: float = 1.0):
     if freq > 1000:
         return f"{freq/1000.0}kHz"
